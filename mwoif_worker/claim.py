@@ -288,6 +288,7 @@ def claim_once(version: str, claim_lane: str = "auto") -> ClaimResult:
             "claim_lane": lane,
             "control_types": [
                 "DEVPLAY_CHECK",
+                "RECEIVER_CAPACITY_PREP",
                 "JOB_PAUSE",
                 "JOB_RESUME",
                 "JOB_CANCEL",

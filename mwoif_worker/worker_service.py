@@ -18,7 +18,13 @@ from mwoif_worker.heart_wave import heart_wave_run
 from mwoif_worker.process_lock import WorkerProcessLock, WorkerProcessLockError, worker_process_lock_path
 from mwoif_worker.observability import OBSERVABILITY
 from mwoif_worker.provider_guard import get_provider_guard
+from mwoif_worker.provider_recovery import (
+    provider_auto_recovery_enabled,
+    provider_recovery_min_interval_seconds,
+    run_provider_router_recovery,
+)
 from mwoif_worker.runtime_context import runtime_scope
+from mwoif_worker.sender_session_pool import get_login_circuit
 from mwoif_worker.shard_scheduler import ElasticShardPool
 from mwoif_worker.startup_recovery import recover_worker_startup
 
@@ -215,6 +221,81 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
         if was_degraded:
             emit("WORKER WEB LINK RECOVERED protocol=signed-v3 secretOutput=NONE")
 
+    def _provider_runtime_rearm() -> None:
+        nonlocal claim_failure_streak, claim_backoff_until, heart_next_claim_at, control_next_claim_at
+        with claim_health_lock:
+            claim_failure_streak = 0
+            claim_backoff_until = 0.0
+        with claim_pace_lock:
+            heart_next_claim_at = 0.0
+            control_next_claim_at = 0.0
+        web_link_ok()
+
+    def admin_resume_rearm(job_id: int) -> None:
+        _provider_runtime_rearm()
+        emit(
+            f"P6.2 PROVIDER RESUME ARMED sj_id={int(job_id)} claimBackoff=cleared "
+            "newClaims=true secretOutput=NONE"
+        )
+
+    def provider_auto_recovery_thread() -> None:
+        if not provider_auto_recovery_enabled():
+            return
+        last_incident = 0
+        last_attempt_at = 0.0
+        wait_logged_incident = 0
+        min_interval = provider_recovery_min_interval_seconds()
+        while not drain_event.wait(1.0):
+            guard = get_provider_guard()
+            if not guard.is_open():
+                wait_logged_incident = 0
+                continue
+            snapshot = guard.snapshot()
+            incident = int(snapshot.opened_at_unix or 0)
+            if incident < 1 or incident == last_incident:
+                continue
+            active_jobs = longrun_pool_guard.active_jobs()
+            if active_jobs > 0:
+                if wait_logged_incident != incident:
+                    emit(
+                        f"P6.2 AUTO ROUTER RECOVERY WAIT safeBoundary=false activeJobs={active_jobs} "
+                        "secretOutput=NONE"
+                    )
+                    wait_logged_incident = incident
+                continue
+            since_last = time.monotonic() - last_attempt_at if last_attempt_at > 0 else float(min_interval)
+            if since_last < float(min_interval):
+                if wait_logged_incident != -incident:
+                    emit(
+                        f"P6.2 AUTO ROUTER RECOVERY HOLD cooldown={int(max(1.0, min_interval-since_last))}s "
+                        "providerHold=true secretOutput=NONE"
+                    )
+                    wait_logged_incident = -incident
+                continue
+
+            last_incident = incident
+            last_attempt_at = time.monotonic()
+            emit(
+                f"P6.2 AUTO ROUTER RECOVERY START distinct={snapshot.distinct_accounts}/{snapshot.threshold} "
+                f"primary={snapshot.primary_code or 'UNKNOWN'} safeBoundary=true secretOutput=NONE"
+            )
+            result = run_provider_router_recovery(version, snapshot, event_cb=emit)
+            if not result.ok:
+                emit(
+                    f"P6.2 AUTO ROUTER RECOVERY FAIL code={result.code} providerHold=true "
+                    f"elapsed={result.elapsed_ms/1000:.2f}s secretOutput=NONE"
+                )
+                continue
+
+            guard.reset()
+            get_login_circuit().reset()
+            reset_http_pools()
+            _provider_runtime_rearm()
+            emit(
+                f"P6.2 AUTO ROUTER RECOVERY DONE resumedJobs={result.resumed_jobs} "
+                f"elapsed={result.elapsed_ms/1000:.2f}s newClaims=true secretOutput=NONE"
+            )
+
     def claim_is_link_problem(claim) -> bool:
         return str(getattr(claim, "code", "") or "") in {
             "CLAIM_NETWORK_ERROR",
@@ -377,7 +458,7 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
                 job = claim.job or {}
                 work_type = str(job.get("work_type") or "").upper()
                 supported_controls = {
-                    "DEVPLAY_CHECK", "JOB_PAUSE", "JOB_RESUME", "JOB_CANCEL",
+                    "DEVPLAY_CHECK", "RECEIVER_CAPACITY_PREP", "JOB_PAUSE", "JOB_RESUME", "JOB_CANCEL",
                     "ACCOUNT_SESSION_PURGE", "ACCOUNT_LOGIN_CHECK", "WORKER_DRAIN",
                 }
                 if work_type not in supported_controls:
@@ -404,6 +485,7 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
                         registry=control_registry,
                         drain_event=drain_event,
                         event_cb=emit,
+                        resume_hook=admin_resume_rearm,
                     )
                 except Exception:
                     control = None
@@ -492,11 +574,12 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
                         f"age={float(pool_state.get('age_seconds') or 0.0):.1f}s secretOutput=NONE"
                     )
 
-                if str(job.get("work_type") or "").upper() == "DEVPLAY_CHECK":
+                if str(job.get("work_type") or "").upper() in {"DEVPLAY_CHECK", "RECEIVER_CAPACITY_PREP"}:
                     wcr_id = job.get("wcr_id")
+                    fallback_control_type = str(job.get("work_type") or "").upper()
                     emit(
                         f"P8.2.5 CONTROL START runtime={runner_no} wcr_id={wcr_id} "
-                        "type=DEVPLAY_CHECK secretOutput=NONE"
+                        f"type={fallback_control_type} secretOutput=NONE"
                     )
                     try:
                         control = process_control_request(
@@ -504,6 +587,7 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
                             job,
                             str(claim.claim_token or ""),
                             event_cb=emit,
+                            resume_hook=admin_resume_rearm,
                         )
                     except Exception:
                         control = None
@@ -655,7 +739,8 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
     threading.Thread(target=api_thread, name="mwoif-p1-api", daemon=True).start()
     emit(
         f"WORKER SERVICE START mode=web-auto engine=r7-phase7b-full-account-check base=p8.2.6-dedicated-control-lane "
-        f"multiJob=true controlPull=true dedicatedControl=true signedV3=true replayGuard=true ramGuard=true runners={concurrent_jobs} "
+        f"multiJob=true controlPull=true dedicatedControl=true signedV3=true replayGuard=true ramGuard=true "
+        f"autoRouterRecovery={str(provider_auto_recovery_enabled()).lower()} runners={concurrent_jobs} "
         f"controlRunners={control_runners} controlPollMs={control_poll_ms} shardSlots={total_shard_slots} secretOutput=NONE"
     )
 
@@ -747,6 +832,13 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
         name="mwoif-memory-guard",
         daemon=True,
     ).start()
+    if provider_auto_recovery_enabled():
+        threading.Thread(
+            target=provider_auto_recovery_thread,
+            name="mwoif-provider-auto-recovery",
+            daemon=True,
+        ).start()
+        emit("P6.2 AUTO ROUTER RECOVERY armed=true mode=on-demand secretOutput=NONE")
 
     for control_no in range(1, control_runners + 1):
         thread = threading.Thread(

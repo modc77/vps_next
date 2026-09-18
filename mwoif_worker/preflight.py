@@ -54,6 +54,36 @@ def run_preflight() -> dict:
         if not path.is_file():
             errors.append(f"{name}_MISSING")
 
+    auto_router_recovery = str(os.getenv("MWOIF_PROVIDER_AUTO_ROUTER_RECOVERY") or "0").strip().lower() not in {"0", "false", "no", "off"}
+    if auto_router_recovery:
+        recovery_url = str(os.getenv("MWOIF_WEB_PROVIDER_RECOVERY_URL") or "").strip()
+        recovery_parts = urlsplit(recovery_url)
+        recovery_host = (recovery_parts.hostname or "").lower()
+        recovery_loopback = recovery_host in {"127.0.0.1", "localhost", "::1"}
+        if (
+            not recovery_host
+            or recovery_parts.scheme.lower() not in {"http", "https"}
+            or recovery_parts.path != "/work/worker/provider-recovery.php"
+            or recovery_parts.username is not None
+            or recovery_parts.password is not None
+            or recovery_parts.query
+            or recovery_parts.fragment
+            or (not recovery_loopback and recovery_parts.scheme.lower() != "https")
+        ):
+            errors.append("MWOIF_WEB_PROVIDER_RECOVERY_URL_INVALID")
+        if os.name != "nt":
+            errors.append("PROVIDER_AUTO_ROUTER_RECOVERY_WINDOWS_REQUIRED")
+        script_raw = str(os.getenv("MWOIF_PROVIDER_ROUTER_REBOOT_SCRIPT") or "tools/ZTE_F616_Reboot_Worker.bat").strip()
+        script_path = Path(script_raw)
+        if not script_path.is_absolute():
+            script_path = _ROOT / script_path
+        if not script_path.is_file():
+            errors.append("ROUTER_REBOOT_SCRIPT_MISSING")
+        if not str(os.getenv("MWOIF_ROUTER_USERNAME") or "").strip():
+            errors.append("MWOIF_ROUTER_USERNAME_MISSING")
+        if not str(os.getenv("MWOIF_ROUTER_PASSWORD") or ""):
+            errors.append("MWOIF_ROUTER_PASSWORD_MISSING")
+
     persist_enabled = str(os.getenv("MWOIF_SENDER_SESSION_PERSIST_ENABLED") or "1").strip().lower() not in {"0", "false", "no", "off"}
     if persist_enabled:
         try:

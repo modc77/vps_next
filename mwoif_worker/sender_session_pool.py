@@ -73,7 +73,8 @@ class SenderSessionPool:
 
     def __init__(self) -> None:
         self.enabled = _env_bool("MWOIF_SENDER_SESSION_CACHE_ENABLED", True)
-        self.ttl_seconds = _env_int("MWOIF_SENDER_SESSION_TTL_SECONDS", 604800, 300, 2592000)
+        self.idle_ttl_seconds = _env_int("MWOIF_SENDER_SESSION_TTL_SECONDS", 604800, 300, 2592000)
+        self.ttl_seconds = _env_int("MWOIF_SENDER_SESSION_ABSOLUTE_TTL_SECONDS", 1800, 300, 2592000)
         self.max_entries = _env_int("MWOIF_SENDER_SESSION_POOL_MAX", 1000, 10, 5000)
         self.preferred_limit = _env_int("MWOIF_SENDER_SESSION_PREFERRED_LIMIT", 500, 10, 1000)
         self.persistent_enabled = _env_bool("MWOIF_SENDER_SESSION_PERSIST_ENABLED", True)
@@ -184,7 +185,13 @@ class SenderSessionPool:
             created_wall = _safe_int(data.get("created_wall"))
             last_used_wall = _safe_int(data.get("last_used_wall"), created_wall)
             now_wall = int(time.time())
-            if created_wall <= 0 or now_wall - created_wall > self.persistent_max_age_seconds:
+            age_seconds = now_wall - created_wall
+            if (
+                created_wall <= 0
+                or age_seconds < 0
+                or age_seconds >= self.ttl_seconds
+                or age_seconds > self.persistent_max_age_seconds
+            ):
                 return None
             auth = self._auth_from_dict(data.get("auth"))
             session = self._session_from_dict(data.get("session"))
@@ -279,13 +286,18 @@ class SenderSessionPool:
 
     def _purge_locked(self, now: float) -> None:
         expired: list[int] = []
+        now_wall = int(time.time())
         for sga_id, entry in self._entries.items():
+            age_seconds = now_wall - entry.created_wall
             if (
-                now - entry.last_used_mono >= self.ttl_seconds
+                now - entry.last_used_mono >= self.idle_ttl_seconds
+                or entry.created_wall <= 0
+                or age_seconds < 0
+                or age_seconds >= self.ttl_seconds
                 or not entry.auth.ready
                 or not entry.session.established
                 or self._token_expired(entry.auth)
-                or int(time.time()) - entry.created_wall > self.persistent_max_age_seconds
+                or age_seconds > self.persistent_max_age_seconds
             ):
                 expired.append(sga_id)
         for sga_id in expired:
@@ -337,8 +349,6 @@ class SenderSessionPool:
         now_mono = time.monotonic()
         now_wall = int(time.time())
         with self._lock:
-            existing = self._entries.get(int(sga_id))
-            created_wall = existing.created_wall if existing is not None and existing.created_wall > 0 else now_wall
             entry = SenderSessionEntry(
                 sga_id=int(sga_id),
                 auth=auth,
@@ -346,7 +356,7 @@ class SenderSessionPool:
                 email_fp=_email_fp(email),
                 created_mono=now_mono,
                 last_used_mono=now_mono,
-                created_wall=created_wall,
+                created_wall=now_wall,
                 last_used_wall=now_wall,
                 source="fresh",
             )
@@ -384,6 +394,7 @@ class SenderSessionPool:
                 "enabled": self.enabled,
                 "size": len(self._entries),
                 "ttl_seconds": self.ttl_seconds,
+                "idle_ttl_seconds": self.idle_ttl_seconds,
                 "max_entries": self.max_entries,
                 "hits": self._hits,
                 "persistent_hits": self._persistent_hits,
@@ -496,6 +507,15 @@ class LoginCircuitBreaker:
                     )
                 return True
             return self._state in {"open", "half_open"}
+
+    def reset(self) -> None:
+        with self._cond:
+            self._recent.clear()
+            self._state = "closed"
+            self._open_until = 0.0
+            self._open_count = 0
+            self._probe_owner = 0
+            self._cond.notify_all()
 
     def snapshot(self) -> dict[str, int | str | bool]:
         with self._cond:

@@ -14,8 +14,8 @@ from mwoif_worker.devplay.login_check import DevPlayLoginChecker
 from mwoif_worker.job_control import JobControlRegistry
 from mwoif_worker.provider_alert import send_provider_incident_alert
 from mwoif_worker.provider_guard import get_provider_guard
-from mwoif_worker.receiver_relationships import ReceiverRelationshipError, receiver_relationship_readiness
-from mwoif_worker.sender_session_pool import get_sender_session_pool
+from mwoif_worker.receiver_relationships import ReceiverRelationshipError, receiver_relationship_prepare_capacity, receiver_relationship_readiness
+from mwoif_worker.sender_session_pool import get_login_circuit, get_sender_session_pool
 from mwoif_worker.work_security import signed_headers
 
 try:
@@ -163,6 +163,8 @@ def _commit_result(
             "capacity": max(1, min(300, int(safe_result.get("capacity") or 300))),
             "available_at_least": max(0, min(300, int(safe_result.get("available_at_least") or 0))),
             "required_free_slots": max(1, min(300, int(safe_result.get("required_free_slots") or 100))),
+            "removed_count": max(0, min(300, int(safe_result.get("removed_count") or 0))),
+            "friends_before": max(0, min(300, int(safe_result.get("friends_before") or 0))),
         },
     }
     last_code = "CONTROL_RESULT_NETWORK_ERROR"
@@ -314,6 +316,79 @@ def _full_receiver_account_check(email: str, password: str) -> dict[str, Any]:
     }
 
 
+
+def _prepare_receiver_capacity(email: str, password: str, event_cb: Event | None) -> dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        from mwoif_worker.heart_one import _login_and_session
+
+        cfg, auth, _session = _login_and_session(
+            email=email,
+            password=password,
+            account_kind="receiver-capacity",
+            account_id=0,
+            slot="R",
+            event_cb=None,
+        )
+    except Exception as exc:
+        code = str(getattr(exc, "code", None) or type(exc).__name__)[:80]
+        stage = str(getattr(exc, "stage", None) or "LOGIN")[:40].upper()
+        login_ok = stage.startswith("SESSION") or code == "INITMEMBER3_FAILED"
+        return {
+            "ok": False,
+            "credential_valid": login_ok,
+            "code": code or "DEVPLAY_LOGIN_FAILED",
+            "stage": "GAME_SESSION" if login_ok else "LOGIN",
+            "retryable": bool(getattr(exc, "retryable", True)),
+            "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+            "account_login_ok": login_ok,
+            "game_session_ok": False,
+            "friend_api_ok": False,
+            "relationship_ready": False,
+        }
+
+    try:
+        prepared = receiver_relationship_prepare_capacity(
+            cfg,
+            auth,
+            event_cb=event_cb,
+            target_friends=200,
+            capacity=300,
+        )
+    except ReceiverRelationshipError as exc:
+        return {
+            "ok": False,
+            "credential_valid": True,
+            "code": str(exc.code or "RECEIVER_CAPACITY_PREP_FAILED")[:80],
+            "stage": "CAPACITY",
+            "retryable": bool(exc.retryable),
+            "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+            "account_login_ok": True,
+            "game_session_ok": True,
+            "friend_api_ok": True,
+            "relationship_ready": False,
+        }
+
+    return {
+        "ok": True,
+        "credential_valid": True,
+        "code": "RECEIVER_CAPACITY_READY",
+        "stage": "CAPACITY",
+        "retryable": False,
+        "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+        "account_login_ok": True,
+        "game_session_ok": True,
+        "friend_api_ok": True,
+        "relationship_ready": prepared.available_slots >= 100,
+        "friends_bound": prepared.friends_after,
+        "pending_count": prepared.pending_after,
+        "capacity": 300,
+        "available_at_least": prepared.available_slots,
+        "required_free_slots": 100,
+        "removed_count": prepared.trimmed_friends,
+        "friends_before": prepared.friends_before,
+    }
+
 def process_control_request(
     version: str,
     job: dict[str, Any],
@@ -322,6 +397,7 @@ def process_control_request(
     registry: JobControlRegistry | None = None,
     drain_event=None,
     event_cb: Event | None = None,
+    resume_hook: Callable[[int], None] | None = None,
 ) -> ControlProcessResult:
     started = time.perf_counter()
     work_type = str(job.get("work_type") or "").strip().upper()
@@ -332,6 +408,7 @@ def process_control_request(
         request_id, target_id = 0, 0
     supported = {
         "DEVPLAY_CHECK",
+        "RECEIVER_CAPACITY_PREP",
         "JOB_PAUSE",
         "JOB_RESUME",
         "JOB_CANCEL",
@@ -352,7 +429,7 @@ def process_control_request(
 
     safe_result: dict[str, Any]
 
-    if work_type in {"DEVPLAY_CHECK", "ACCOUNT_LOGIN_CHECK"}:
+    if work_type in {"DEVPLAY_CHECK", "RECEIVER_CAPACITY_PREP", "ACCOUNT_LOGIN_CHECK"}:
         provider_guard = get_provider_guard()
         if provider_guard.is_open():
             safe_result = {
@@ -382,6 +459,8 @@ def process_control_request(
         try:
             if work_type == "DEVPLAY_CHECK":
                 safe_result = _full_receiver_account_check(email, password)
+            elif work_type == "RECEIVER_CAPACITY_PREP":
+                safe_result = _prepare_receiver_capacity(email, password, event_cb)
             else:
                 login_result = DevPlayLoginChecker().check(email, password, event_cb=None)
                 safe_result = {
@@ -462,6 +541,21 @@ def process_control_request(
             _, signal = registry.request(target_id, "cancel" if work_type == "JOB_CANCEL" else "pause")
             if signal is not None:
                 signal.mark_applied()
+        if work_type == "JOB_RESUME":
+            provider_was_open = get_provider_guard().is_open()
+            login_state = str(get_login_circuit().snapshot().get("state") or "closed")
+            get_provider_guard().reset()
+            get_login_circuit().reset()
+            if resume_hook is not None:
+                try:
+                    resume_hook(target_id)
+                except Exception:
+                    pass
+            if event_cb is not None:
+                event_cb(
+                    f"P6.2 PROVIDER RESET source=admin-resume sj_id={target_id} "
+                    f"providerWasOpen={str(provider_was_open).lower()} loginCircuitWas={login_state} secretOutput=NONE"
+                )
         if work_type == "WORKER_DRAIN" and drain_event is not None:
             drain_event.set()
     return committed

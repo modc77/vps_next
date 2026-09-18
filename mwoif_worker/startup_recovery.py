@@ -24,6 +24,7 @@ class StartupRecoveryResult:
     retryable: bool
     elapsed_ms: float
     safe_requeued: int = 0
+    recovery_requeued: int = 0
     protected_jobs: int = 0
     control_requeued: int = 0
     released_slots: int = 0
@@ -145,6 +146,7 @@ def recover_worker_startup(version: str) -> StartupRecoveryResult:
         retryable=False,
         elapsed_ms=(time.perf_counter() - started) * 1000.0,
         safe_requeued=n("safe_requeued"),
+        recovery_requeued=n("recovery_requeued"),
         protected_jobs=n("protected_jobs"),
         control_requeued=n("control_requeued"),
         released_slots=n("released_slots"),

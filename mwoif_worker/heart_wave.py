@@ -34,7 +34,8 @@ from mwoif_worker.shard_scheduler import ElasticShardPool
 from mwoif_worker.sender_session_pool import get_login_circuit, get_sender_session_pool, is_ip_suspect_code
 from mwoif_worker.provider_alert import send_provider_incident_alert
 from mwoif_worker.provider_guard import get_provider_guard
-from mwoif_worker.receiver_relationships import ReceiverRelationshipError, receiver_relationship_preflight
+from mwoif_worker.receiver_relationships import ReceiverRelationshipError, receiver_relationship_job_guard, receiver_reconcile_batch_relationships
+from mwoif_worker.heart_relationship_journal import clear_relationship_journal, load_relationship_stages, record_batch_leased, record_relationship_stage
 
 Event = Callable[[str], None]
 _ROOT = Path(__file__).resolve().parents[1]
@@ -105,7 +106,7 @@ class HeartWaveResult:
             "batches": self.batches,
             "failed_attempts": self.failed_attempts,
             "recovery_required": self.recovery_required,
-            "mode": "performance-wave-catchup-v1",
+            "mode": "phase8-exact-heart-v1",
             "secretOutput": "NONE",
         }
 
@@ -129,6 +130,17 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
     except Exception:
         value = default
     return max(lo, min(hi, value))
+
+
+def _require_exact_batch_budget(stage: str, budget: int, senders: list[WaveSender] | None = None, sender_ids: set[int] | None = None) -> None:
+    budget = int(budget)
+    if budget < 1 or budget > 100:
+        raise HeartWaveError("HEART_EXACT_BUDGET_INVALID", "Heart batch budget is invalid", retryable=False)
+    values = [int(w.sga_id) for w in (senders or [])] if sender_ids is None else [int(v) for v in sender_ids]
+    if len(values) != len(set(values)):
+        raise HeartWaveError("HEART_EXACT_BUDGET_DUPLICATE", f"Heart {stage} contains a duplicate Sender", retryable=False)
+    if len(values) > budget:
+        raise HeartWaveError("HEART_EXACT_BUDGET_EXCEEDED", f"Heart {stage} exceeds the exact batch budget", retryable=False)
 
 
 def _endpoint(env_name: str, default: str, suffix: str) -> str:
@@ -282,7 +294,7 @@ def _fetch_receiver_session(version: str, event_cb: Event | None):
     return worker_code, sj_id, claim_token, api_key, cfg, auth, session
 
 
-def _lease_batch(version: str, *, worker_code: str, sj_id: int, claim_token: str, api_key: str, count: int) -> tuple[list[WaveSender], int]:
+def _lease_batch(version: str, *, worker_code: str, sj_id: int, claim_token: str, api_key: str, count: int) -> tuple[list[WaveSender], int, int, int, int]:
     raw_tokens = [secrets.token_urlsafe(32) for _ in range(count)]
     hashes = [hashlib.sha256(t.encode("utf-8")).hexdigest() for t in raw_tokens]
     preferred = get_sender_session_pool().preferred_ids()
@@ -301,8 +313,18 @@ def _lease_batch(version: str, *, worker_code: str, sj_id: int, claim_token: str
     if not bool(data.get("leased")):
         raise HeartWaveError(str(data.get("code") or "NO_READY_HEART_SENDER"), str(data.get("message") or "No Sender batch available"), retryable=bool(data.get("retryable", True)))
     batch_no = int(data.get("batch_no") or 0)
+    budget = int(data.get("batch_budget_count") or 0)
+    completed = int(data.get("completed_value") or 0)
+    target = int(data.get("target_value") or 0)
+    remaining = int(data.get("remaining_before_lease") or 0)
     rows = data.get("senders")
-    if batch_no < 1 or batch_no > 1_000_000 or not isinstance(rows, list) or not rows:
+    if (
+        batch_no < 1 or batch_no > 1_000_000
+        or budget < 1 or budget > count
+        or completed < 0 or target < 1 or completed >= target
+        or remaining != target - completed or budget > remaining
+        or not isinstance(rows, list) or not rows
+    ):
         raise HeartWaveError("SENDER_BATCH_LEASE_RESPONSE_INVALID", "Sender batch lease response is invalid")
     works: list[WaveSender] = []
     seen: set[int] = set()
@@ -315,7 +337,8 @@ def _lease_batch(version: str, *, worker_code: str, sj_id: int, claim_token: str
             raise HeartWaveError("SENDER_BATCH_LEASE_RESPONSE_INVALID", "Sender batch lease response is invalid")
         seen.add(sga_id)
         works.append(WaveSender(sga_id=sga_id, lease_token=raw_tokens[idx]))
-    return works, batch_no
+    _require_exact_batch_budget("LEASE", budget, works)
+    return works, batch_no, budget, completed, target
 
 
 def _fetch_batch_credentials(version: str, *, worker_code: str, sj_id: int, claim_token: str, api_key: str, works: list[WaveSender]) -> None:
@@ -368,7 +391,8 @@ def _hydrate_cached_sender_sessions(works: list[WaveSender], event_cb: Event | N
         _event(
             event_cb,
             f"P10.1 SESSION CACHE HYDRATE hits={hits}/{len(works)} pool={stats['size']} "
-            f"persistentHits={stats['persistent_hits']} ttl={stats['ttl_seconds']}s secretOutput=NONE",
+            f"persistentHits={stats['persistent_hits']} absoluteTtl={stats['ttl_seconds']}s "
+            f"idleTtl={stats['idle_ttl_seconds']}s secretOutput=NONE",
         )
     return hits
 
@@ -595,6 +619,8 @@ def _elastic_prepare_shards(
     grpc_timeout: float,
     stop_event: threading.Event | None,
     event_cb: Event | None,
+    sj_id: int,
+    batch_no: int,
 ) -> tuple[list[WaveSender], list[WaveSender], list[WaveSender], list[WaveSender], dict[str, int]]:
     """Prepare Sender chunks through the shared elastic execution-slot pool.
 
@@ -652,16 +678,20 @@ def _elastic_prepare_shards(
                     work.error_code = "PROVIDER_IP_CIRCUIT_OPEN"
                     work.failure_stage = "LOGIN"
             else:
+                def tracked_add(work: WaveSender):
+                    record_relationship_stage(sj_id=sj_id, batch_no=batch_no, sga_id=work.sga_id, stage="ADD_ATTEMPT")
+                    return send_friend_request(
+                        cfg=cfg, slot="S", auth=work.auth, target_mid=receiver_auth.mid,
+                        source_type=source_type, timeout=grpc_timeout, live=True,
+                    )
+
                 add_ok, add_failed = _parallel_stage(
                     login_ok,
                     max_workers=min(add_workers_per_slot, max(1, len(login_ok))),
                     stage="ADD",
                     event_cb=None,
                     log_every=max(1, len(login_ok)),
-                    fn=lambda w: send_friend_request(
-                        cfg=cfg, slot="S", auth=w.auth, target_mid=receiver_auth.mid,
-                        source_type=source_type, timeout=grpc_timeout, live=True,
-                    ),
+                    fn=tracked_add,
                 )
             add_ms_local = int(round((time.perf_counter() - t1) * 1000.0))
             for work in add_failed:
@@ -840,21 +870,69 @@ def _report_orphan_recovery(version: str, *, worker_code: str, sj_id: int, claim
 
 def _recover_orphan_batch(version: str, *, worker_code: str, sj_id: int, claim_token: str, api_key: str, cfg, receiver_auth: AuthRecord, receiver_session: SessionRecord, login_workers: int, mailbox_attempts: int, mailbox_delay: float, grpc_timeout: float, event_cb: Event | None) -> dict[str, Any] | None:
     works = _fetch_orphan_recovery_credentials(version, worker_code=worker_code, sj_id=sj_id, claim_token=claim_token, api_key=api_key)
+    journal = load_relationship_stages(sj_id)
     if not works:
+        if journal:
+            clear_relationship_journal(sj_id)
         return None
+
     recovery_started = time.perf_counter()
     ids = sorted(w.sga_id for w in works)
     recovery_id = hashlib.sha256((str(sj_id) + ":" + ",".join(str(i) for i in ids)).encode("utf-8")).hexdigest()[:40]
-    _event(event_cb, f"P7.2 RECOVERY START sj_id={sj_id} orphanLeases={len(works)} secretOutput=NONE")
+    _event(event_cb, f"P7D RECOVERY START sj_id={sj_id} orphanLeases={len(works)} journal={len(journal)} secretOutput=NONE")
 
     login_ok, login_failed = _login_senders(works, workers=login_workers, event_cb=event_cb)
     for w in login_failed:
         w.outcome = "recovery_required"
         w.error_code = w.error_code or "ORPHAN_SENDER_LOGIN_FAILED"
 
-    found = _mailbox_map(cfg=cfg, receiver_session=receiver_session, receiver_auth=receiver_auth, works=login_ok, attempts=mailbox_attempts, delay=mailbox_delay, event_cb=event_cb)
-    mail_ready: list[WaveSender] = []
+    add_only: list[WaveSender] = []
+    send_intent: list[WaveSender] = []
+    delivered_proven: list[WaveSender] = []
+    unknown_stage: list[WaveSender] = []
     for w in login_ok:
+        stage = str((journal.get(w.sga_id) or {}).get("stage") or "").upper()
+        w.steps["RECOVERY_STAGE"] = stage or "UNKNOWN"
+        if stage == "LEASED":
+            w.outcome = "retryable_failure"
+            w.error_code = "ORPHAN_PRE_ADD_SAFE"
+            w.cleanup_ok = True
+        elif stage == "ADD_ATTEMPT":
+            add_only.append(w)
+        elif stage == "SEND_INTENT":
+            send_intent.append(w)
+        elif stage == "DELIVERED":
+            delivered_proven.append(w)
+        else:
+            unknown_stage.append(w)
+            w.outcome = "recovery_required"
+            w.error_code = "ORPHAN_RELATIONSHIP_STAGE_UNKNOWN"
+
+    add_unresolved: set[str] = set()
+    if add_only:
+        try:
+            reconciled = receiver_reconcile_batch_relationships(
+                cfg, receiver_auth, [w.mid for w in add_only if w.mid],
+                event_cb=event_cb, scope="orphan-add",
+            )
+            add_unresolved = set(reconciled.unresolved_mids)
+        except Exception:
+            add_unresolved = {w.mid for w in add_only if w.mid}
+        for w in add_only:
+            if w.mid and w.mid not in add_unresolved:
+                w.outcome = "retryable_failure"
+                w.error_code = "ORPHAN_RELATIONSHIP_RECONCILED"
+                w.cleanup_ok = True
+            else:
+                w.outcome = "recovery_required"
+                w.error_code = "ORPHAN_RELATIONSHIP_RECONCILE_FAILED"
+
+    found = _mailbox_map(
+        cfg=cfg, receiver_session=receiver_session, receiver_auth=receiver_auth,
+        works=send_intent, attempts=mailbox_attempts, delay=mailbox_delay, event_cb=event_cb,
+    ) if send_intent else {}
+    mail_ready: list[WaveSender] = []
+    for w in send_intent:
         member_seq = int(w.member_seq or 0)
         seq = int(found.get(member_seq) or 0)
         if seq > 0:
@@ -862,41 +940,63 @@ def _recover_orphan_batch(version: str, *, worker_code: str, sj_id: int, claim_t
             mail_ready.append(w)
         else:
             w.outcome = "recovery_required"
-            w.error_code = "ORPHAN_LIFE_MAIL_NOT_FOUND"
+            w.error_code = "ORPHAN_SEND_MAIL_UNRESOLVED"
 
-    delivered, unresolved = _receive_safe(cfg=cfg, receiver_session=receiver_session, receiver_auth=receiver_auth, works=mail_ready, event_cb=event_cb)
-    delivered_ids = {w.sga_id for w in delivered}
-    unresolved_ids = {w.sga_id for w in unresolved}
-    for w in works:
-        if w.sga_id in delivered_ids:
-            w.outcome = "delivered"
-            w.error_code = ""
-        elif w.sga_id in unresolved_ids:
-            w.outcome = "recovery_required"
-            w.error_code = w.error_code or "ORPHAN_RECEIVE_UNRESOLVED"
+    received, receive_unresolved = _receive_safe(
+        cfg=cfg, receiver_session=receiver_session, receiver_auth=receiver_auth,
+        works=mail_ready, event_cb=event_cb,
+    ) if mail_ready else ([], [])
+    received_ids = {w.sga_id for w in received}
+    unresolved_ids = {w.sga_id for w in receive_unresolved}
+    for w in received:
+        record_relationship_stage(
+            sj_id=sj_id,
+            batch_no=int((journal.get(w.sga_id) or {}).get("batch_no") or 1),
+            sga_id=w.sga_id,
+            stage="DELIVERED",
+        )
+        w.outcome = "delivered"
+        w.error_code = ""
+    for w in receive_unresolved:
+        w.outcome = "recovery_required"
+        w.error_code = w.error_code or "ORPHAN_RECEIVE_UNRESOLVED"
 
-    mids = [w.mid for w in delivered if w.mid]
-    cleanup_ok = True
-    if mids:
+    delivered_map: dict[int, WaveSender] = {w.sga_id: w for w in delivered_proven}
+    for w in received:
+        delivered_map[w.sga_id] = w
+    delivered = list(delivered_map.values())
+    for w in delivered_proven:
+        w.outcome = "delivered"
+        w.error_code = ""
+
+    cleanup_unresolved: set[str] = set()
+    delivered_mids = [w.mid for w in delivered if w.mid]
+    if delivered_mids:
         try:
-            cleanup = remove_friend(cfg=cfg, slot="R", auth=receiver_auth, target_mids=mids, timeout=grpc_timeout, live=True)
-            cleanup_ok = bool(cleanup.get("ok"))
+            cleanup = receiver_reconcile_batch_relationships(
+                cfg, receiver_auth, delivered_mids,
+                event_cb=event_cb, scope="orphan-delivered",
+            )
+            cleanup_unresolved = set(cleanup.unresolved_mids)
         except Exception:
-            cleanup_ok = False
+            cleanup_unresolved = set(delivered_mids)
     for w in delivered:
-        w.cleanup_ok = cleanup_ok
-    if not cleanup_ok:
-        for w in delivered:
-            w.outcome = "recovery_required"
-            w.error_code = "ORPHAN_FRIEND_CLEANUP_FAILED"
+        w.cleanup_ok = bool(w.mid and w.mid not in cleanup_unresolved)
 
     report = _report_orphan_recovery(
         version, worker_code=worker_code, sj_id=sj_id, claim_token=claim_token, api_key=api_key,
         recovery_id=recovery_id, works=works, runtime_ms=int(round((time.perf_counter()-recovery_started)*1000.0)),
         receiver_member_seq=int(receiver_session.member_seq),
     )
+    clear_relationship_journal(sj_id)
     job = report.get("job") if isinstance(report.get("job"), dict) else {}
-    _event(event_cb, f"P7.2 RECOVERY DONE delivered={len(delivered)}/{len(works)} progress={job.get('completed_value','?')}/{job.get('target_value','?')} status={job.get('status','?')} secretOutput=NONE")
+    _event(
+        event_cb,
+        f"P7D RECOVERY DONE delivered={len(delivered)}/{len(works)} addReconciled={len(add_only)-len(add_unresolved)} "
+        f"sendUnresolved={len(send_intent)-len(mail_ready)} cleanupUnresolved={len(cleanup_unresolved)} "
+        f"unknownStage={len(unknown_stage)} progress={job.get('completed_value','?')}/{job.get('target_value','?')} "
+        f"status={job.get('status','?')} secretOutput=NONE",
+    )
     for w in works:
         w.password = ""
         w.email = ""
@@ -949,6 +1049,7 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
     send_workers = _env_int("MWOIF_HEART_TURBO_SEND_WORKERS", 14, 1, 50)
     accept_attempts = _env_int("MWOIF_HEART_TURBO_ACCEPT_ATTEMPTS", 1, 1, 4)
     mailbox_attempts = _env_int("MWOIF_HEART_TURBO_MAILBOX_ATTEMPTS", 8, 1, 20)
+    send_explicit_retry_attempts = _env_int("MWOIF_HEART_SEND_EXPLICIT_RETRY_ATTEMPTS", 3, 1, 5)
     wave_stagger = _env_float("MWOIF_HEART_TURBO_WAVE_STAGGER_SECONDS", 0.20, 0.0, 1.0)
     add_settle = _env_float("MWOIF_HEART_TURBO_ADD_SETTLE_SECONDS", 0.45, 0.0, 2.0)
     friend_settle = _env_float("MWOIF_HEART_TURBO_FRIEND_SETTLE_SECONDS", 0.22, 0.0, 2.0)
@@ -1042,7 +1143,7 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
             return HeartWaveResult(False, "HEART_WAVE_RECOVERY_REQUIRED", "Orphan Heart batch requires manual review", True, (time.perf_counter()-started)*1000.0, sj_id, start_progress, progress, target, progress-start_progress, batches, failed_total, True)
 
     try:
-        receiver_relationship_preflight(
+        receiver_relationship_job_guard(
             cfg, receiver_auth, event_cb=event_cb, target_friends=200, capacity=300,
         )
     except ReceiverRelationshipError as exc:
@@ -1095,7 +1196,16 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
         shard_count = 0
         shard_peak = 0
         try:
-            works, durable_batch_no = _lease_batch(version, worker_code=worker_code, sj_id=sj_id, claim_token=claim_token, api_key=api_key, count=wanted)
+            works, durable_batch_no, batch_budget, lease_completed, lease_target = _lease_batch(version, worker_code=worker_code, sj_id=sj_id, claim_token=claim_token, api_key=api_key, count=wanted)
+            progress = max(progress, lease_completed)
+            target = lease_target
+            wanted = batch_budget
+            attempted_sender_ids: set[int] = {w.sga_id for w in works}
+            try:
+                record_batch_leased(sj_id=sj_id, batch_no=durable_batch_no, sga_ids={w.sga_id for w in works})
+            except Exception as exc:
+                raise HeartWaveError("RELATIONSHIP_JOURNAL_WRITE_FAILED", "Batch relationship journal could not be written safely", retryable=True) from exc
+            _event(event_cb, f"P8 EXACT BUDGET batch={durable_batch_no} budget={batch_budget} leased={len(works)} progress={progress}/{target} secretOutput=NONE")
             _event(event_cb, f"P7.2 BATCH #{durable_batch_no} LEASED {len(works)}/{wanted} secretOutput=NONE")
             _hydrate_cached_sender_sessions(works, event_cb=event_cb)
             credential_works = [w for w in works if w.auth is None or w.session is None]
@@ -1119,6 +1229,8 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
                 grpc_timeout=grpc_timeout,
                 stop_event=None,
                 event_cb=event_cb,
+                sj_id=sj_id,
+                batch_no=durable_batch_no,
             )
             shard_prepare_ms = int(shard_stats.get("wall_ms") or 0)
             shard_count = int(shard_stats.get("shards") or 0)
@@ -1144,13 +1256,17 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
                     w.error_code = "PROVIDER_IP_CIRCUIT_OPEN"
                     w.failure_stage = "LOGIN"
             else:
+                def tracked_add(work: WaveSender):
+                    record_relationship_stage(sj_id=sj_id, batch_no=durable_batch_no, sga_id=work.sga_id, stage="ADD_ATTEMPT")
+                    return send_friend_request(cfg=cfg, slot="S", auth=work.auth, target_mid=receiver_auth.mid, source_type=source_type, timeout=grpc_timeout, live=True)
+
                 add_ok, add_failed = _parallel_stage(
                     login_ok,
                     max_workers=add_workers,
                     stage="ADD",
                     event_cb=event_cb,
                     log_every=progress_log_every,
-                    fn=lambda w: send_friend_request(cfg=cfg, slot="S", auth=w.auth, target_mid=receiver_auth.mid, source_type=source_type, timeout=grpc_timeout, live=True),
+                    fn=tracked_add,
                 )
             add_ms = int(round((time.perf_counter() - stage_started) * 1000.0))
             for w in add_failed:
@@ -1166,34 +1282,46 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
             if provider_guard.mark_alert_sent():
                 alert_ok = send_provider_incident_alert(version, snapshot)
                 _event(event_cb, f"P6.2 PROVIDER ALERT sent={str(alert_ok).lower()} secretOutput=NONE")
-            pending_created = [w for w in add_ok if w.mid]
-            if pending_created:
-                reject_workers = min(10, len(pending_created))
-                with ThreadPoolExecutor(max_workers=max(1, reject_workers), thread_name_prefix="provider-pending-reject") as reject_pool:
-                    reject_futures = [
-                        reject_pool.submit(
-                            handle_friend_request, cfg=cfg, slot="R", auth=receiver_auth,
-                            target_mid=w.mid, accept=False, timeout=grpc_timeout, live=True,
-                        ) for w in pending_created
-                    ]
-                    for future in as_completed(reject_futures):
-                        try:
-                            future.result()
-                        except Exception:
-                            pass
+            provider_cleanup_targets: list[WaveSender] = []
+            provider_seen: set[int] = set()
+            for work in add_ok + add_failed:
+                if work.sga_id in provider_seen or not work.mid:
+                    continue
+                provider_seen.add(work.sga_id)
+                provider_cleanup_targets.append(work)
+            provider_unresolved: set[str] = set()
+            if provider_cleanup_targets:
+                try:
+                    reconciled = receiver_reconcile_batch_relationships(
+                        cfg, receiver_auth, [w.mid for w in provider_cleanup_targets],
+                        event_cb=event_cb, scope=f"batch-{durable_batch_no}-provider",
+                    )
+                    provider_unresolved = set(reconciled.unresolved_mids)
+                except Exception:
+                    provider_unresolved = {w.mid for w in provider_cleanup_targets if w.mid}
             for w in works:
-                if w.outcome != "delivered":
+                if w.outcome == "delivered":
+                    continue
+                if w.mid and w.mid in provider_unresolved:
+                    w.outcome = "recovery_required"
+                    w.error_code = "BATCH_RELATIONSHIP_RECONCILE_FAILED"
+                    w.failure_stage = "RECONCILE"
+                else:
                     w.outcome = "retryable_failure"
                     w.error_code = "PROVIDER_IP_LIMIT_SUSPECTED"
                     w.failure_stage = "LOGIN"
+                    if w.mid and w.sga_id in provider_seen:
+                        w.cleanup_ok = True
             runtime_ms = int(round((time.perf_counter() - batch_started) * 1000.0))
+            provider_pause_reason = "BATCH_RELATIONSHIP_RECONCILE_FAILED" if provider_unresolved else "PROVIDER_IP_LIMIT_SUSPECTED"
             report = _report_batch(
                 version, worker_code=worker_code, sj_id=sj_id, claim_token=claim_token, api_key=api_key,
                 batch_no=durable_batch_no, works=works, runtime_ms=runtime_ms,
                 receiver_member_seq=int(receiver_session.member_seq),
-                metrics={"ready_count": len(login_ok), "add_count": len(add_ok), "provider_incident": True},
-                pause_reason="PROVIDER_IP_LIMIT_SUSPECTED",
+                metrics={"ready_count": len(login_ok), "add_count": len(add_ok), "provider_incident": True, "relationship_unresolved": len(provider_unresolved)},
+                pause_reason=provider_pause_reason,
             )
+            clear_relationship_journal(sj_id)
             job_remote = report.get("job") if isinstance(report.get("job"), dict) else {}
             return HeartWaveResult(False, "PROVIDER_IP_LIMIT_SUSPECTED", "Provider/public-IP login incident detected; job paused", True, (time.perf_counter()-started)*1000.0, sj_id, start_progress, int(job_remote.get("completed_value") or progress), target, delivered_total, batches, failed_total)
 
@@ -1239,10 +1367,15 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
                     final_login_failed.append(work)
                 pending_failed = []
                 login_replaced_total += len(replacements)
+                attempted_sender_ids.update(w.sga_id for w in replacements)
                 if not replacements:
                     break
 
                 try:
+                    try:
+                        record_batch_leased(sj_id=sj_id, batch_no=durable_batch_no, sga_ids={w.sga_id for w in replacements})
+                    except Exception as exc:
+                        raise HeartWaveError("RELATIONSHIP_JOURNAL_WRITE_FAILED", "Replacement relationship journal could not be written safely", retryable=True) from exc
                     _hydrate_cached_sender_sessions(replacements, event_cb=event_cb)
                     replacement_credential_works = [w for w in replacements if w.auth is None or w.session is None]
                     if replacement_credential_works:
@@ -1281,6 +1414,8 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
                         grpc_timeout=grpc_timeout,
                         stop_event=None,
                         event_cb=event_cb,
+                        sj_id=sj_id,
+                        batch_no=durable_batch_no,
                     )
                     shard_prepare_ms += int(repl_stats.get("wall_ms") or 0)
                     shard_count += int(repl_stats.get("shards") or 0)
@@ -1295,16 +1430,20 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
                     for work in repl_login_failed:
                         work.outcome = "retryable_failure"
                         work.error_code = work.error_code or "SENDER_LOGIN_FAILED"
+                    def tracked_replacement_add(work: WaveSender):
+                        record_relationship_stage(sj_id=sj_id, batch_no=durable_batch_no, sga_id=work.sga_id, stage="ADD_ATTEMPT")
+                        return send_friend_request(
+                            cfg=cfg, slot="S", auth=work.auth, target_mid=receiver_auth.mid,
+                            source_type=source_type, timeout=grpc_timeout, live=True,
+                        )
+
                     repl_add_ok, repl_add_failed = _parallel_stage(
                         repl_login_ok,
                         max_workers=min(add_workers, max(1, len(repl_login_ok))),
                         stage="ADD",
                         event_cb=event_cb,
                         log_every=max(1, min(progress_log_every, len(repl_login_ok))),
-                        fn=lambda w: send_friend_request(
-                            cfg=cfg, slot="S", auth=w.auth, target_mid=receiver_auth.mid,
-                            source_type=source_type, timeout=grpc_timeout, live=True,
-                        ),
+                        fn=tracked_replacement_add,
                     )
                     for work in repl_add_failed:
                         work.outcome = "retryable_failure"
@@ -1350,6 +1489,8 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
                 f"finalLoginFail={len(login_failed)} activeBatch={len(works)}/{wanted} secretOutput=NONE",
             )
 
+        _require_exact_batch_budget("ACTIVE", batch_budget, works)
+        _require_exact_batch_budget("ADD", batch_budget, add_ok)
         if add_settle > 0 and add_ok:
             time.sleep(add_settle)
 
@@ -1394,6 +1535,7 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
             if friend_settle > 0:
                 time.sleep(friend_settle + (work.sga_id % 7) * 0.008)
             try:
+                record_relationship_stage(sj_id=sj_id, batch_no=durable_batch_no, sga_id=work.sga_id, stage="SEND_INTENT")
                 with send_sem:
                     sent = heart_send(cfg=cfg, actor_slot="S", target_slot="R", actor_session=work.session, target_session=receiver_session, actor_auth=work.auth, live=True, timeout=ds_timeout)
                 work.steps["SEND"] = _summary(sent)
@@ -1493,6 +1635,7 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
                 if friend_settle > 0:
                     time.sleep(max(0.05, friend_settle * 0.75) + (work.sga_id % 7) * 0.006)
                 try:
+                    record_relationship_stage(sj_id=sj_id, batch_no=durable_batch_no, sga_id=work.sga_id, stage="SEND_INTENT")
                     with send_sem:
                         sent = heart_send(
                             cfg=cfg, actor_slot="S", target_slot="R",
@@ -1547,17 +1690,27 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
                 continue
             _seen_sent.add(_work.sga_id)
             sent_candidates.append(_work)
+        _require_exact_batch_budget("SEND", batch_budget, sent_candidates)
         stage_started = time.perf_counter()
         found = _mailbox_map(cfg=cfg, receiver_session=receiver_session, receiver_auth=receiver_auth, works=sent_candidates, attempts=mailbox_attempts, delay=mailbox_delay, event_cb=event_cb)
         for w in sent_candidates:
             if w.member_seq in found:
                 w.mail_seq = found[int(w.member_seq)]
 
-        # Explicit first-pass failures proven absent from mailbox get exactly one bounded
-        # retry. The retry outcome is classified again so a confirmed/unknown second SEND
-        # is never downgraded to a safe retryable failure merely because mail is delayed.
         retry_candidates = [w for w in send_explicit_failed if not w.mail_seq]
-        if retry_candidates:
+        for retry_no in range(1, send_explicit_retry_attempts + 1):
+            retry_candidates = [
+                w for w in retry_candidates
+                if not w.mail_seq and w.send_class.startswith("explicit_failed")
+            ]
+            if not retry_candidates:
+                break
+
+            _event(
+                event_cb,
+                f"P8 SEND RECOVERY #{retry_no} start={len(retry_candidates)} "
+                f"max={send_explicit_retry_attempts} secretOutput=NONE",
+            )
             retry_confirmed: list[WaveSender] = []
             retry_explicit_failed: list[WaveSender] = []
             retry_unknown: list[WaveSender] = []
@@ -1565,34 +1718,45 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
 
             def retry_send_one(work: WaveSender) -> WaveSender:
                 try:
+                    record_relationship_stage(
+                        sj_id=sj_id, batch_no=durable_batch_no, sga_id=work.sga_id, stage="SEND_INTENT"
+                    )
                     sent = heart_send(
                         cfg=cfg, actor_slot="S", target_slot="R",
                         actor_session=work.session, target_session=receiver_session,
                         actor_auth=work.auth, live=True, timeout=ds_timeout,
                     )
-                    work.steps["SEND_RETRY"] = _summary(sent)
+                    work.steps[f"SEND_RETRY_{retry_no}"] = _summary(sent)
                     if bool(sent.get("ok")):
-                        work.send_class = "confirmed_retry"
+                        work.send_class = f"confirmed_retry_{retry_no}"
                         work.error_code = ""
                         bucket = retry_confirmed
                     elif _explicit_send_failure(sent):
-                        work.send_class = "explicit_failed_retry"
-                        work.error_code = str(sent.get("error") or sent.get("response_code") or "SEND_EXPLICIT_FAILED")[:80]
+                        work.send_class = f"explicit_failed_retry_{retry_no}"
+                        work.error_code = str(
+                            sent.get("error") or sent.get("response_code") or "SEND_EXPLICIT_FAILED"
+                        )[:80]
+                        work.failure_stage = "SEND"
                         bucket = retry_explicit_failed
                     else:
-                        work.send_class = "unknown_retry"
+                        work.send_class = f"unknown_retry_{retry_no}"
                         work.error_code = "SEND_RETRY_OUTCOME_UNKNOWN"
+                        work.failure_stage = "SEND"
                         bucket = retry_unknown
                 except Exception:
-                    work.send_class = "unknown_retry"
+                    work.send_class = f"unknown_retry_{retry_no}"
                     work.error_code = "SEND_RETRY_OUTCOME_UNKNOWN"
+                    work.failure_stage = "SEND"
                     bucket = retry_unknown
                 with retry_lock:
                     bucket.append(work)
                 return work
 
             retry_workers = min(8, send_workers, len(retry_candidates))
-            with ThreadPoolExecutor(max_workers=max(1, retry_workers), thread_name_prefix="p72-send-retry") as pool:
+            with ThreadPoolExecutor(
+                max_workers=max(1, retry_workers),
+                thread_name_prefix=f"p72-send-retry-{retry_no}",
+            ) as pool:
                 futures = [pool.submit(retry_send_one, w) for w in retry_candidates]
                 for future in as_completed(futures):
                     future.result()
@@ -1600,25 +1764,38 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
             retry_all = retry_confirmed + retry_explicit_failed + retry_unknown
             retry_found = _mailbox_map(
                 cfg=cfg, receiver_session=receiver_session, receiver_auth=receiver_auth,
-                works=retry_all, attempts=min(4, mailbox_attempts), delay=mailbox_delay, event_cb=event_cb,
+                works=retry_all, attempts=min(4, mailbox_attempts),
+                delay=mailbox_delay, event_cb=event_cb,
             )
+            recovered_now = 0
+            ambiguous_now = 0
             for w in retry_all:
                 if w.member_seq in retry_found:
                     w.mail_seq = retry_found[int(w.member_seq)]
-                elif w.send_class == "explicit_failed_retry":
+                    w.error_code = ""
+                    recovered_now += 1
+                elif w.send_class.startswith("explicit_failed"):
                     w.outcome = "retryable_failure"
                     w.error_code = w.error_code or "SEND_EXPLICIT_FAILED"
+                    w.failure_stage = "SEND"
                 else:
-                    # A confirmed/unknown retry without mailbox proof is ambiguous.
-                    # Pause/recover instead of ever issuing a third SEND.
                     w.outcome = "recovery_required"
                     w.error_code = w.error_code or "LIFE_MAIL_SEQ_NOT_FOUND_AFTER_RETRY"
+                    w.failure_stage = "SEND"
+                    ambiguous_now += 1
+
+            retry_candidates = [w for w in retry_explicit_failed if not w.mail_seq]
+            _event(
+                event_cb,
+                f"P8 SEND RECOVERY #{retry_no} recovered={recovered_now} "
+                f"remainingExplicit={len(retry_candidates)} ambiguous={ambiguous_now} secretOutput=NONE",
+            )
 
         mail_ready: list[WaveSender] = []
         for w in sent_candidates:
             if w.mail_seq:
                 mail_ready.append(w)
-            elif w.send_class in {"explicit_failed", "explicit_failed_retry"}:
+            elif w.send_class.startswith("explicit_failed"):
                 if w.outcome != "recovery_required":
                     w.outcome = "retryable_failure"
                     w.error_code = w.error_code or "SEND_EXPLICIT_FAILED"
@@ -1630,7 +1807,9 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
         delivered, receive_unresolved = _receive_safe(cfg=cfg, receiver_session=receiver_session, receiver_auth=receiver_auth, works=mail_ready, event_cb=event_cb)
         mailbox_receive_ms = int(round((time.perf_counter() - stage_started) * 1000.0))
         delivered_ids = {w.sga_id for w in delivered}
+        _require_exact_batch_budget("DELIVERED", batch_budget, sender_ids=delivered_ids)
         for w in delivered:
+            record_relationship_stage(sj_id=sj_id, batch_no=durable_batch_no, sga_id=w.sga_id, stage="DELIVERED")
             w.outcome = "delivered"
             w.error_code = ""
             w.failure_stage = ""
@@ -1639,42 +1818,60 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
             w.error_code = w.error_code or "HEART_RECEIVE_FAILED"
             w.failure_stage = "RECEIVE"
 
-        # Free receiver friend slots for Sender attempts that reached ADD/ACCEPT but
-        # did not become a confirmed delivery. This mirrors the proven V3 cleanup
-        # path and prevents friend-capacity leakage across batches.
         stage_cleanup_targets: list[WaveSender] = []
         _stage_seen: set[int] = set()
-        for _work in (accept_failed + send_explicit_failed + send_unknown):
+        for _work in (add_failed + accept_failed + send_explicit_failed + send_unknown):
             if _work.sga_id in _stage_seen or not _work.mid:
                 continue
             _stage_seen.add(_work.sga_id)
             stage_cleanup_targets.append(_work)
+
+        cleanup_sga_ids: set[int] = set()
         stage_cleanup_ok = True
+        stage_unresolved_mids: set[str] = set()
         if stage_cleanup_targets:
             try:
-                stage_cleanup = remove_friend(
-                    cfg=cfg, slot="R", auth=receiver_auth,
-                    target_mids=[w.mid for w in stage_cleanup_targets],
-                    timeout=grpc_timeout, live=True,
+                stage_reconcile = receiver_reconcile_batch_relationships(
+                    cfg, receiver_auth, [w.mid for w in stage_cleanup_targets],
+                    event_cb=event_cb, scope=f"batch-{durable_batch_no}-failed",
                 )
-                stage_cleanup_ok = bool(stage_cleanup.get("ok"))
+                stage_unresolved_mids = set(stage_reconcile.unresolved_mids)
             except Exception:
-                stage_cleanup_ok = False
+                stage_unresolved_mids = {w.mid for w in stage_cleanup_targets if w.mid}
+            stage_cleanup_ok = not stage_unresolved_mids
+            for w in stage_cleanup_targets:
+                if w.mid not in stage_unresolved_mids:
+                    w.cleanup_ok = True
+                    cleanup_sga_ids.add(w.sga_id)
+                else:
+                    w.cleanup_ok = False
+                    w.outcome = "recovery_required"
+                    w.error_code = "BATCH_RELATIONSHIP_RECONCILE_FAILED"
+                    w.failure_stage = "RECONCILE"
 
-        # One receiver-side bulk cleanup for successfully received Hearts.
         cleanup_ok = True
-        mids = [w.mid for w in delivered if w.mid]
-        if mids:
+        delivery_unresolved_mids: set[str] = set()
+        delivered_mids = [w.mid for w in delivered if w.mid]
+        if delivered_mids:
             try:
-                cleanup = remove_friend(cfg=cfg, slot="R", auth=receiver_auth, target_mids=mids, timeout=grpc_timeout, live=True)
-                cleanup_ok = bool(cleanup.get("ok"))
+                delivery_reconcile = receiver_reconcile_batch_relationships(
+                    cfg, receiver_auth, delivered_mids,
+                    event_cb=event_cb, scope=f"batch-{durable_batch_no}-delivered",
+                )
+                delivery_unresolved_mids = set(delivery_reconcile.unresolved_mids)
             except Exception:
-                cleanup_ok = False
+                delivery_unresolved_mids = set(delivered_mids)
+            cleanup_ok = not delivery_unresolved_mids
         for w in delivered:
-            w.cleanup_ok = cleanup_ok
+            w.cleanup_ok = bool(w.mid and w.mid not in delivery_unresolved_mids)
+            if w.cleanup_ok:
+                cleanup_sga_ids.add(w.sga_id)
 
         batch_runtime_ms = int(round((time.perf_counter() - batch_started) * 1000.0))
         metrics = {
+            "exact_budget": batch_budget,
+            "exact_progress_before": progress,
+            "exact_target": target,
             "ready_count": len(login_ok),
             "add_count": len(add_ok),
             "accept_count": len(accepted),
@@ -1696,6 +1893,14 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
             "progress_log_every": progress_log_every,
             "stage_cleanup_ok": bool(stage_cleanup_ok),
             "delivery_cleanup_ok": bool(cleanup_ok),
+            "batch_sender_ids": sorted({w.sga_id for w in works}),
+            "attempted_sender_ids": sorted(attempted_sender_ids),
+            "request_sent_ids": sorted({w.sga_id for w in add_ok}),
+            "accepted_ids": sorted({w.sga_id for w in accepted}),
+            "heart_sent_ids": sorted({w.sga_id for w in sent_candidates}),
+            "delivered_ids": sorted(delivered_ids),
+            "cleanup_ids": sorted(cleanup_sga_ids),
+            "relationship_unresolved": len(stage_unresolved_mids.union(delivery_unresolved_mids)),
             "accept_catchup_passes": accept_catchup_passes,
             "accept_catchup_recovered": catchup_recovered,
             "prepare_ms": prepare_ms,
@@ -1730,12 +1935,13 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
             event_cb,
             f"P10.1 SESSION POOL size={pool_stats['size']} hits={pool_stats['hits']} persistentHits={pool_stats['persistent_hits']} "
             f"misses={pool_stats['misses']} writes={pool_stats['persistent_writes']} persistErrors={pool_stats['persistent_errors']} "
-            f"ttl={pool_stats['ttl_seconds']}s maxAge={pool_stats['persistent_max_age_seconds']}s "
+            f"absoluteTtl={pool_stats['ttl_seconds']}s idleTtl={pool_stats['idle_ttl_seconds']}s "
+            f"persistFileMaxAge={pool_stats['persistent_max_age_seconds']}s "
             f"circuit={circuit_stats['state']} remaining={circuit_stats['remaining_seconds']}s secretOutput=NONE",
         )
         commit_started = time.perf_counter()
         projected_no_progress = no_progress_batches + (0 if delivered_ids else 1)
-        pause_reason = "FRIEND_CLEANUP_FAILED" if (not stage_cleanup_ok or not cleanup_ok) else ""
+        pause_reason = "BATCH_RELATIONSHIP_RECONCILE_FAILED" if (not stage_cleanup_ok or not cleanup_ok) else ""
         if not pause_reason and not delivered_ids and projected_no_progress >= max_no_progress:
             pause_reason = "HEART_WAVE_NO_PROGRESS_LIMIT"
             _event(
@@ -1757,6 +1963,7 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
                 metrics=metrics,
                 pause_reason=pause_reason,
             )
+            clear_relationship_journal(sj_id)
         finally:
             # Credentials/session tokens remain in process memory only; drop plaintext fields immediately.
             for w in works:
@@ -1769,6 +1976,8 @@ def heart_wave_run(version: str, *, live: bool, event_cb: Event | None = None, s
         status_new = str(job_remote.get("status") or "claimed")
         delivered_batch = int((report.get("batch") or {}).get("delivered_count") or 0) if isinstance(report.get("batch"), dict) else len(delivered_ids)
         recovery_batch = int((report.get("batch") or {}).get("recovery_count") or 0) if isinstance(report.get("batch"), dict) else len(receive_unresolved)
+        if delivered_batch < 0 or delivered_batch > batch_budget or progress_new < progress or progress_new > target or progress_new - progress != delivered_batch:
+            raise HeartWaveError("HEART_EXACT_PROGRESS_MISMATCH", "Heart batch progress does not match exact delivered count", retryable=False)
         failed_batch = len([w for w in works if w.outcome in {"retryable_failure", "failed"}])
         delivered_total += delivered_batch
         failed_total += failed_batch

@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from mwoif_worker.provider_guard import ProviderIncidentSnapshot
+from mwoif_worker.provider_recovery import provider_auto_recovery_enabled
 from mwoif_worker.work_security import signed_headers
 
 
@@ -63,6 +64,7 @@ def send_provider_incident_alert(version: str, snapshot: ProviderIncidentSnapsho
             "primary_code": str(snapshot.primary_code or "")[:80],
             "opened_at_unix": int(snapshot.opened_at_unix),
             "code_counts": {str(k)[:80]: int(v) for k, v in list(snapshot.code_counts.items())[:8]},
+            "auto_router_recovery": provider_auto_recovery_enabled(),
         }
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         request = Request(
