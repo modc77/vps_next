@@ -386,6 +386,26 @@ class SenderSessionPool:
             keys.reverse()
             return keys[:cap]
 
+    def preferred_ids_excluding_mids(self, excluded_mids: set[str], limit: int | None = None) -> list[int]:
+        if not self.enabled:
+            return []
+        blocked = {str(mid).strip() for mid in excluded_mids if str(mid).strip()}
+        now = time.monotonic()
+        with self._lock:
+            self._purge_locked(now)
+            cap = self.preferred_limit if limit is None else max(1, min(self.preferred_limit, int(limit)))
+            entries = list(self._entries.values())
+            entries.reverse()
+            result: list[int] = []
+            for entry in entries:
+                mid = str(entry.auth.mid or '').strip()
+                if mid and mid in blocked:
+                    continue
+                result.append(int(entry.sga_id))
+                if len(result) >= cap:
+                    break
+            return result
+
     def stats(self) -> dict[str, int | bool]:
         now = time.monotonic()
         with self._lock:

@@ -15,6 +15,8 @@ from mwoif_worker.control_request import process_control_request
 from mwoif_worker.job_control import JobControlRegistry
 from mwoif_worker.memory_guard import collect as memory_collect, policy_from_env as memory_policy_from_env, snapshot as memory_snapshot
 from mwoif_worker.heart_wave import heart_wave_run
+from mwoif_worker.friend_fill import friend_fill_run
+from mwoif_worker.friend_clear import friend_clear_run
 from mwoif_worker.process_lock import WorkerProcessLock, WorkerProcessLockError, worker_process_lock_path
 from mwoif_worker.observability import OBSERVABILITY
 from mwoif_worker.provider_guard import get_provider_guard
@@ -631,9 +633,33 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
                     f"allocation={alloc['allocation']}/{total_shard_slots} activeJobs={alloc['active_jobs']} secretOutput=NONE"
                 )
                 job_control_signal = control_registry.register(sj_id, runner_no)
+                service_code = str(job.get("service_code") or "").upper()
                 try:
-                    result = heart_wave_run(version, live=True, event_cb=runtime_event, stop_event=job_control_signal,
-                                            shard_pool=shard_pool, shard_job_key=shard_job_key)
+                    if service_code == "FRIEND_FILL_300":
+                        result = friend_fill_run(
+                            version,
+                            live=True,
+                            event_cb=runtime_event,
+                            stop_event=job_control_signal,
+                            shard_pool=shard_pool,
+                            shard_job_key=shard_job_key,
+                        )
+                    elif service_code == "FRIEND_CLEAR":
+                        result = friend_clear_run(
+                            version,
+                            live=True,
+                            event_cb=runtime_event,
+                            stop_event=job_control_signal,
+                        )
+                    else:
+                        result = heart_wave_run(
+                            version,
+                            live=True,
+                            event_cb=runtime_event,
+                            stop_event=job_control_signal,
+                            shard_pool=shard_pool,
+                            shard_job_key=shard_job_key,
+                        )
                 except Exception as exc:
                     control_registry.unregister(sj_id)
                     shard_pool.unregister(shard_job_key)
@@ -643,7 +669,7 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
                         f"P8.1 RUNTIME #{runner_no} SHARD POOL RELEASE sj_id={sj_id} reason=exception secretOutput=NONE"
                     )
                     safe_code = str(getattr(exc, "code", None) or type(exc).__name__)[:80]
-                    hold_runner(runner_no, sj_id=sj_id, code=f"UNHANDLED_HEART_WAVE_ERROR/{safe_code}")
+                    hold_runner(runner_no, sj_id=sj_id, code=f"UNHANDLED_JOB_ERROR/{safe_code}")
                     return
 
                 shard_pool.unregister(shard_job_key)
@@ -652,7 +678,14 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
                     f"P8.1 RUNTIME #{runner_no} SHARD POOL RELEASE sj_id={sj_id} reason=job-boundary secretOutput=NONE"
                 )
 
-                if str(result.code or "") in {"HEART_WAVE_PAUSE_SAFEPOINT", "HEART_WAVE_CANCEL_SAFEPOINT"}:
+                if str(result.code or "") in {
+                    "HEART_WAVE_PAUSE_SAFEPOINT",
+                    "HEART_WAVE_CANCEL_SAFEPOINT",
+                    "FRIEND_FILL_PAUSE_SAFEPOINT",
+                    "FRIEND_FILL_CANCEL_SAFEPOINT",
+                    "FRIEND_CLEAR_PAUSE_SAFEPOINT",
+                    "FRIEND_CLEAR_CANCEL_SAFEPOINT",
+                }:
                     mode = "pause" if "PAUSE" in str(result.code or "") else "cancel"
                     emit(
                         f"P11 RUNTIME #{runner_no} CONTROL HOLD sj_id={sj_id} mode={mode} "

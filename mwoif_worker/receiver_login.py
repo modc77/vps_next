@@ -187,7 +187,7 @@ def _active_claim() -> tuple[str, int, str]:
         sj_id = int(job.get("sj_id") or 0)
     except Exception as exc:
         raise ReceiverLoginConfigError("P3_ACTIVE_CLAIM_INVALID") from exc
-    if sj_id < 1 or str(job.get("service_code") or "") != "HEART_PUMP":
+    if sj_id < 1 or str(job.get("service_code") or "") not in {"HEART_PUMP", "FRIEND_FILL_300", "FRIEND_CLEAR"}:
         raise ReceiverLoginConfigError("P3_ACTIVE_CLAIM_INVALID")
     return worker_code, sj_id, token
 
