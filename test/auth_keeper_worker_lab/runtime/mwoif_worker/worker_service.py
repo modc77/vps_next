@@ -9,6 +9,7 @@ from typing import Callable
 
 from mwoif.net.http_pool import reset_http_pools
 from mwoif_worker.api_server import run_api
+from mwoif_worker.auth_keeper_lab import AuthKeeperLab
 from mwoif_worker.claim import claim_once, clear_claim_state
 from mwoif_worker.heartbeat import send_heartbeat
 from mwoif_worker.control_request import process_control_request
@@ -779,7 +780,7 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
 
     threading.Thread(target=api_thread, name="mwoif-p1-api", daemon=True).start()
     emit(
-        f"WORKER SERVICE START mode=web-auto engine=r7-phase7b-full-account-check base=p8.2.6-dedicated-control-lane "
+        f"WORKER LAB SERVICE START mode=web-auto engine=auth-keeper-worker-lab-v1 base=p8.2.6-dedicated-control-lane "
         f"multiJob=true controlPull=true dedicatedControl=true signedV3=true replayGuard=true ramGuard=true "
         f"autoRouterRecovery={str(provider_auto_recovery_enabled()).lower()} runners={concurrent_jobs} "
         f"controlRunners={control_runners} controlPollMs={control_poll_ms} shardSlots={total_shard_slots} secretOutput=NONE"
@@ -880,6 +881,26 @@ def worker_service_run(version: str, *, event_cb: Event | None = None) -> int:
             daemon=True,
         ).start()
         emit("P6.2 AUTO ROUTER RECOVERY armed=true mode=on-demand secretOutput=NONE")
+
+    if str(os.getenv("MWOIF_AUTH_KEEPER_LAB_ENABLED") or "0").strip().lower() not in {"0", "false", "no", "off"}:
+        try:
+            keeper = AuthKeeperLab(stop_event=drain_event, event_cb=emit)
+        except Exception as exc:
+            emit(
+                f"LAB AUTH KEEPER START FAIL code={type(exc).__name__} "
+                "workerContinues=false secretOutput=NONE"
+            )
+            drain_event.set()
+            shutdown_event.set()
+            process_lock.release()
+            return 1
+        keeper_thread = threading.Thread(
+            target=keeper.run,
+            name="mwoif-auth-keeper-lab",
+            daemon=False,
+        )
+        control_threads.append(keeper_thread)
+        keeper_thread.start()
 
     for control_no in range(1, control_runners + 1):
         thread = threading.Thread(

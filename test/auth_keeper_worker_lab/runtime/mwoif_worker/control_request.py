@@ -222,19 +222,32 @@ def _credential_check(
     return credential, "", False
 
 
-def _full_receiver_account_check(email: str, password: str) -> dict[str, Any]:
+def _full_receiver_account_check(email: str, password: str, *, target_sga_id: int = 0, event_cb: Event | None = None) -> dict[str, Any]:
     started = time.perf_counter()
     try:
         from mwoif_worker.heart_one import _login_and_session
 
+        lab_capture = str(os.getenv("MWOIF_AUTH_KEEPER_LAB_CAPTURE_CONTROL_LOGIN") or "0").strip().lower() not in {"0", "false", "no", "off"}
+        account_id = int(target_sga_id) if lab_capture and int(target_sga_id) > 0 else 0
+        account_kind = "sender" if account_id > 0 else "receiver-check"
+        slot = "S" if account_id > 0 else "R"
         cfg, auth, _session = _login_and_session(
             email=email,
             password=password,
-            account_kind="receiver-check",
-            account_id=0,
-            slot="R",
+            account_kind=account_kind,
+            account_id=account_id,
+            slot=slot,
             event_cb=None,
         )
+        if account_id > 0:
+            get_sender_session_pool().put(account_id, email, auth, _session)
+            if event_cb is not None:
+                state = get_sender_session_pool().lab_entry_state(account_id)
+                remaining = state.get("remaining_seconds") if isinstance(state, dict) else None
+                event_cb(
+                    f"LAB AUTH CAPTURE PASS sga_id={account_id} remaining={remaining} "
+                    "source=ADMIN_BULK_LOGIN secretOutput=NONE"
+                )
     except Exception as exc:
         code = str(getattr(exc, "code", None) or type(exc).__name__)[:80]
         stage = str(getattr(exc, "stage", None) or "LOGIN")[:40].upper()
@@ -592,7 +605,12 @@ def process_control_request(
                 elif service_code == "INVITE_PUMP":
                     safe_result = _invite_target_account_check(email, password, invite_link)
                 else:
-                    safe_result = _full_receiver_account_check(email, password)
+                    safe_result = _full_receiver_account_check(
+                        email,
+                        password,
+                        target_sga_id=target_id,
+                        event_cb=event_cb,
+                    )
             elif work_type == "RECEIVER_CAPACITY_PREP":
                 safe_result = _prepare_receiver_capacity(email, password, event_cb)
             else:
